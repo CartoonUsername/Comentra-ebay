@@ -1,211 +1,263 @@
-# Claude Code Prompt — Comentra eBay Integration (Listing Upload + Order Sync)
+# Claude Code Prompt — Comentra Otto Integration (Listing Upload + Order Sync)
 
-Baue eine vollständige eBay-Integration für die Comentra SaaS-Plattform.
-Zwei Teile: (1) Produkte von Comentra auf eBay hochladen, (2) eBay Orders in Supabase einspielen.
+Baue eine vollständige Otto Partner API Integration für die Comentra SaaS-Plattform.
+Analog zur bestehenden eBay Integration — gleiche Struktur, gleiche Patterns.
 Deployment: docker compose up --build -d auf Hostinger VPS. Kein Vercel.
 
 ---
 
 ## Architektur
 
-Browser (React) → Comentra Backend API (Next.js API Routes) → eBay REST API
-                                    ↓
-                              Supabase (Produkte + Orders)
+Browser (React) → Next.js API Routes → Otto Partner API v4
+                        ↓
+                  Supabase (Produkte + Orders)
 
-Credentials pro Tenant in channels Tabelle (type = 'ebay'):
+Credentials pro Tenant in channels Tabelle (type = 'otto'):
 credentials: {
-  client_id,        ← App ID aus eBay Developer Portal
-  client_secret,    ← Cert ID aus eBay Developer Portal
-  refresh_token,    ← OAuth User Token
-  access_token,     ← kurzlebig, wird automatisch refreshed
+  username,         ← Otto API-Nutzer (aus OPC Portal)
+  password,         ← Otto API-Passwort
+  access_token,     ← Bearer Token (kurzlebig)
   token_expires_at  ← Timestamp für Auto-Refresh
 }
 
 ---
 
-## Teil 1 — Produkte hochladen (eBay Inventory API)
+## Otto Partner API Basis
 
-### Flow (3 Schritte pro Produkt):
+Base URL Live:    https://api.otto.market
+Base URL Sandbox: https://sandbox.api.otto.market
 
-**Schritt 1: Inventory Item erstellen**
-PUT https://api.ebay.com/sell/inventory/v1/inventory_item/{sku}
-Content-Language: de-DE
-{
-  product: {
-    title,
-    description,
-    imageUrls: [...],
-    aspects: { "Marke": ["EmsCraft24"], "Material": ["Holz"] }
-  },
-  condition: "NEW",
-  availability: {
-    shipToLocationAvailability: { quantity: N }
-  },
-  packageWeightAndSize: {
-    weight: { value, unit: "KILOGRAM" },
-    dimensions: { length, width, height, unit: "CENTIMETER" }
-  }
-}
+Auth: OAuth2 Client Credentials
+Token URL: POST https://api.otto.market/v1/token
+  Body (form-urlencoded): grant_type=client_credentials&username={user}&password={pass}
+  Response: { access_token, token_type, expires_in }
+  Header: Authorization: Bearer {access_token}
 
-**Schritt 2: Offer erstellen**
-POST https://api.ebay.com/sell/inventory/v1/offer
-{
-  sku,
-  marketplaceId: "EBAY_DE",
-  format: "FIXED_PRICE",
-  availableQuantity: N,
-  categoryId: "...",   ← eBay Kategorie-ID
-  listingDescription: "...",
-  pricingSummary: {
-    price: { value: "39.99", currency: "EUR" }
-  },
-  fulfillmentPolicyId: "...",   ← aus eBay Account Policies
-  paymentPolicyId: "...",
-  returnPolicyId: "..."
-}
-
-**Schritt 3: Offer publishen**
-POST https://api.ebay.com/sell/inventory/v1/offer/{offerId}/publish
-→ Response: listingId (eBay Item ID)
-→ Speichern in products_marketplace.external_id
-
-### Varianten (Multi-Variation Listing):
-- Für jede Variante: eigenes inventory_item (SKU der Variante)
-- POST /sell/inventory/v1/inventory_item_group (Parent-Gruppe)
-  {
-    inventoryItemGroupKey: "PARENT_SKU",
-    title, description, imageUrls,
-    variantSKUs: ["SKU-ROT-S", "SKU-ROT-M", ...],
-    aspects: { "Größe": ["S", "M", "L"], "Farbe": ["Rot", "Blau"] },
-    variesBy: { aspectsImageVariesBy: ["Farbe"], specifications: [...] }
-  }
-- POST /sell/inventory/v1/offer/{offerId}/publish (pro Variante)
-  ODER: publishOfferByInventoryItemGroup für alle auf einmal
-
-### API Routes (Next.js):
-POST /api/channels/[id]/ebay/upload
-  → nimmt product_id + variant_ids aus Supabase
-  → führt 3-Schritt-Flow aus
-  → speichert external_id (eBay Item ID) in products_marketplace
-
-GET /api/channels/[id]/ebay/categories?q=sandkasten
-  → GET https://api.ebay.com/commerce/taxonomy/v1/category_tree/186/get_category_suggestions?q=...
-  → gibt passende eBay Kategorie-IDs zurück
-
-GET /api/channels/[id]/ebay/policies
-  → GET https://api.ebay.com/sell/account/v1/fulfillment_policy?marketplace_id=EBAY_DE
-  → gibt Versand/Rückgabe/Zahlungs-Profile zurück
+Token-Refresh: automatisch wenn token_expires_at < now() + 5min
+Neuen Token in channels.credentials speichern (service key).
 
 ---
 
-## Teil 2 — Orders sync (eBay Fulfillment API)
+## Teil 1 — Produkte hochladen (Otto Products API v4)
 
-### Cron (alle 5 Minuten, VPS crontab):
-GET https://api.ebay.com/sell/fulfillment/v1/order
-  ?filter=lastmodifieddate:[{last_sync_at}Z..]
-  &limit=200
+### Vorbereitungsschritte (PFLICHT vor Upload):
+
+**Schritt 1: Marken abfragen**
+GET https://api.otto.market/v4/products/brands
+→ Liste aller bei Otto bekannten Marken
+→ Markenname des Produkts muss exakt mit Otto-Markenname übereinstimmen
+
+**Schritt 2: Kategorien abfragen**
+GET https://api.otto.market/v4/products/categories
+→ paginiert, limit=2000
+→ Kategoriename muss exakt mit Otto-Kategorie übereinstimmen
+
+**Schritt 3: Attribute pro Kategorie abfragen**
+GET https://api.otto.market/v4/products/categories/{categoryName}/attributes
+→ Gibt Pflicht-Attribute (featureRelevance=LEGAL → IMMER Pflicht)
+→ Gibt empfohlene Attribute (relevance=HIGH → für bessere Sichtbarkeit)
+→ Gibt variationThemes → welche Attribute Varianten unterscheiden
+
+### Produkt hochladen:
+POST https://api.otto.market/v4/products
+Content-Type: application/json
+[
+  {
+    "sku": "EC-SANDBOX-001-NAT",
+    "productReference": "EC-SANDBOX-001",  ← max 50 Zeichen, gruppiert Varianten
+    "category": "Sandkästen",               ← exakter Otto-Kategoriename
+    "brand": "EmsCraft24",                  ← exakter Otto-Markenname
+    "productLine": "Sandkasten Holz 120x120",
+    "attributes": [
+      { "name": "Material", "values": ["Holz"] },
+      { "name": "Farbe", "values": ["Natur"] },
+      { "name": "Breite (in cm)", "values": ["120"] },
+      { "name": "Tiefe (in cm)", "values": ["120"] }
+    ],
+    "mediaAssets": [
+      { "type": "IMAGE", "url": "https://..." }  ← mind. 1 Bild Pflicht
+    ],
+    "pricing": {
+      "standardPrice": { "amount": 89.99, "currency": "EUR" }
+    },
+    "availability": {
+      "quantity": 10
+    },
+    "shipping": {
+      "type": "PARCEL",
+      "weight": { "value": 5.0, "unit": "kg" },
+      "dimensions": {
+        "length": { "value": 120, "unit": "cm" },
+        "width": { "value": 120, "unit": "cm" },
+        "height": { "value": 30, "unit": "cm" }
+      }
+    },
+    "description": "...",
+    "bulletPoints": ["...", "...", "..."],
+    "eans": ["4251234567890"]
+  }
+]
+
+Response:
+{
+  "state": "pending",
+  "links": [
+    { "rel": "self", "href": "/v4/products/update-tasks/{taskId}" }
+  ]
+}
+
+### Upload-Status pollen:
+GET https://api.otto.market/v4/products/update-tasks/{taskId}
+→ state: PENDING → warten
+→ state: DONE → prüfe succeeded/failed Anzahl
+→ Bei failed: GET /v4/products/update-tasks/{taskId}/failed → Fehlerdetails
+
+### Marketplace-Status prüfen (2. Validierungsstufe):
+GET https://api.otto.market/v4/products/marketplace-status?sku={sku}
+→ Gibt finalen Status auf otto.de
+→ Link zur Produktseite wenn erfolgreich
+
+### Varianten (Multi-Variation):
+- Gleiche productReference = werden automatisch als Varianten zusammengefasst
+- Bsp: productReference = "EC-RAHMEN-001"
+  Variante 1: sku "EC-RAHMEN-001-10x15", attribute "Bildformat": ["10x15 cm"]
+  Variante 2: sku "EC-RAHMEN-001-13x18", attribute "Bildformat": ["13x18 cm"]
+- variationThemes aus Kategorie-Attributen bestimmen was Varianten unterscheidet
+
+### Preise/Bestand aktualisieren:
+PATCH https://api.otto.market/v4/products/{sku}/prices
+PATCH https://api.otto.market/v4/products/{sku}/quantities
+
+### API Routes (Next.js):
+POST /api/channels/[id]/otto/upload
+  → prüft Brands + Categories in Supabase Cache (24h)
+  → baut Otto-Payload aus Supabase-Produktdaten
+  → POST zu Otto API → taskId
+  → pollt taskId alle 5s bis DONE
+  → speichert external_id (Otto SKU) in products_marketplace
+
+GET /api/channels/[id]/otto/categories
+  → cached in Supabase 24h
+
+GET /api/channels/[id]/otto/brands
+  → cached in Supabase 24h
+
+---
+
+## Teil 2 — Orders Sync (Otto Orders API v4)
+
+### Cron (alle 5 Minuten):
+GET https://api.otto.market/v4/orders?fulfillmentStatus=PROCESSABLE
+→ Pagination via nextcursor:
+  while (response.links.next) {
+    GET https://api.otto.market/v4/orders?nextcursor={cursor}
+  }
+
+### Otto Order Status → Comentra Status Mapping:
+ANNOUNCED             → "pending"      ← noch nicht bearbeitbar, Adresse fehlt
+PROCESSABLE           → "confirmed"    ← bereit zur Bearbeitung
+SENT                  → "shipped"
+RETURNED              → "returned"
+CANCELLED_BY_PARTNER      → "cancelled"
+CANCELLED_BY_MARKETPLACE  → "cancelled"
 
 ### Pro Order → Supabase upsert:
 orders:
-  channel_order_id = order.orderId
-  status:
-    AWAITING_PAYMENT  → "pending"
-    ALL_FULFILLED     → "shipped"
-    IN_PROGRESS       → "confirmed"
-    CANCELLED         → "cancelled"
-  payment_status:
-    PAID     → "paid"
-    PENDING  → "pending"
-  currency = order.pricingSummary.total.currency
-  subtotal = order.pricingSummary.priceSubtotal.value
-  shipping_cost = order.pricingSummary.deliveryCost.value
-  tax_amount = order.pricingSummary.tax.value
-  total = order.pricingSummary.total.value
-  shipping_address = order.fulfillmentStartInstructions[0].shippingStep.shipTo
-  ordered_at = order.creationDate
-  paid_at = order.paymentSummary.payments[0].paymentDate
+  channel_order_id = order.salesOrderId
+  status = mapping oben
+  payment_status = "paid"              ← Otto zahlt immer vor Versand
+  currency = "EUR"
+  subtotal = summe positionItems * itemValueGrossPrice.amount
+  shipping_cost = 0                    ← Otto übernimmt Versand
+  total = subtotal
+  shipping_address = order.deliveryAddress (jsonb)
+  ordered_at = order.orderDate
+  metadata = { otto_order_id: order.salesOrderId, positionItems: [...ids] }
 
-order_items (pro lineItem):
-  name = lineItem.title
-  sku = lineItem.sku
-  qty = lineItem.quantity
-  unit_price = lineItem.lineItemCost.value
-  total = lineItem.total.value
-  tax_rate = 19  ← Default für DE
+order_items (pro positionItem):
+  name = positionItem.product.title
+  sku = positionItem.sku
+  qty = positionItem.quantity (meist 1)
+  unit_price = positionItem.itemValueGrossPrice.amount
+  total = unit_price * qty
+  tax_rate = 19
 
-### Tracking zurückschreiben (wenn Comentra versendet):
-POST https://api.ebay.com/sell/fulfillment/v1/order/{orderId}/shipping_fulfillment
+### Tracking zurückschreiben (PFLICHT bei Otto!):
+POST https://api.otto.market/v4/shipments
 {
-  lineItems: [{ lineItemId, quantity }],
-  shippedDate: "2026-03-26T10:00:00Z",
-  shippingCarrierCode: "DHL",
-  trackingNumber: "1234567890"
+  "trackingKey": {
+    "carrier": "DHL",                   ← DHL, HERMES, DPD, GLS, UPS etc.
+    "trackingNumber": "1234567890"
+  },
+  "shipDate": "2026-03-27T10:00:00+01:00",
+  "positionItems": [
+    {
+      "positionItemId": "...",
+      "salesOrderId": "..."
+    }
+  ]
 }
+→ KRITISCH: Ohne Tracking bleibt Otto-Auftrag offen → schlechte Lieferzeit-KPI
+
+### Sandbox Test-Orders generieren:
+POST https://sandbox.api.otto.market/v4/orders/testorders
+→ Erzeugt sofort 8 vordefinierte Test-Szenarien:
+  6x PROCESSABLE, 1x ANNOUNCED (Vorauszahlung), 1x CANCELLED_BY_MARKETPLACE
 
 ---
 
-## OAuth Token Management
-
-Token-Refresh Logik (in services/ebay/auth.js):
-1. Prüfe channels.credentials.token_expires_at
-2. Falls abgelaufen (oder < 5 Min): refresh via:
-   POST https://api.ebay.com/identity/v1/oauth2/token
-   grant_type=refresh_token
-   refresh_token={token}
-   Basic Auth: client_id:client_secret (Base64)
-3. Neuen access_token + expires_in in channels.credentials speichern
-4. Alle API-Calls gehen durch diesen Wrapper
-
----
-
-## Dateistruktur
+## Dateistruktur (analog zu eBay)
 
 src/
   lib/
-    ebay/
-      auth.js           ← Token-Refresh Wrapper
-      inventory.js      ← Inventory API (upload, varianten)
-      fulfillment.js    ← Orders abrufen, Tracking schreiben
-      taxonomy.js       ← Kategorie-Suche
-      account.js        ← Policies abrufen
-  app/api/channels/[id]/ebay/
-    upload/route.js     ← POST: Produkt hochladen
-    orders/route.js     ← GET: Orders sync triggern
-    categories/route.js ← GET: Kategorien suchen
-    policies/route.js   ← GET: Policies laden
+    otto/
+      auth.ts           ← Token-Refresh Wrapper
+      products.ts       ← Products API v4 (upload, brands, categories, status)
+      orders.ts         ← Orders API v4 (sync mit nextcursor Pagination)
+      shipments.ts      ← Tracking zurückschreiben
+  app/api/channels/[id]/otto/
+    upload/route.ts         ← POST: Produkt hochladen
+    upload-status/route.ts  ← GET: taskId Status pollen
+    orders/route.ts         ← GET: Orders sync triggern
+    categories/route.ts     ← GET: Kategorien (24h Cache)
+    brands/route.ts         ← GET: Marken (24h Cache)
 
 comentra-connector/connectors/
-  ebay.js               ← Cron Sync (bereits vorhanden, erweitern)
+  otto.js               ← Cron Sync (bereits vorhanden, erweitern)
 
 ---
 
-## Supabase Updates
+## Supabase
 
 products_marketplace:
-  marketplace = 'ebay'
-  external_id = eBay Item ID (nach publishOffer)
-  status: 'pending' → 'active' nach erfolgreichem Publish
-  error_message = eBay Fehlermeldung bei Misserfolg
+  marketplace = 'otto'
+  external_id = Otto SKU (nach DONE + marketplace-status OK)
+  status: 'pending' → 'active' nach erfolgreichem Upload
+  error_message = Otto Fehlermeldung bei failed
 
-channels:
-  credentials.access_token    ← wird automatisch refreshed
-  credentials.token_expires_at ← Timestamp
+schema_cache (bereits vorhanden):
+  Brands + Categories 24h cachen
+  product_type = 'otto_brands' / 'otto_categories_{page}'
 
 ---
 
 ## .env.example Ergänzungen
-EBAY_CLIENT_ID=           ← App ID aus developer.ebay.com
-EBAY_CLIENT_SECRET=       ← Cert ID
-EBAY_MARKETPLACE_ID=EBAY_DE
-EBAY_SANDBOX=false        ← true für Tests
+OTTO_API_BASE_URL=https://api.otto.market
+OTTO_SANDBOX_URL=https://sandbox.api.otto.market
+OTTO_USE_SANDBOX=false    ← true für Tests
 
 ---
 
-## Wichtige Hinweise
+## Wichtige Otto-spezifische Hinweise
+- Otto erstellt Rechnungen selbst → KEINE Rechnungen für Otto-Orders in Comentra
+- Tracking ist PFLICHT — fehlende Sendungsnummern → schlechte Seller-KPI
+- Produktupload ist ASYNCHRON — taskId immer bis DONE pollen
+- ANNOUNCED Orders haben noch keine Lieferadresse → erst bei PROCESSABLE verarbeiten
+- Brands + Categories müssen exakt mit Otto-Namen übereinstimmen → immer erst abfragen
+- Attribute mit featureRelevance=LEGAL sind absolut Pflicht
+- Sandbox zurücksetzen: jeden ersten Sonntag im Monat
+- Pagination: nextcursor statt page/offset
 - tenant_id bei allen Supabase-Queries Pflicht
-- Token-Refresh transparent im Wrapper — kein manueller Eingriff nötig
-- eBay Sandbox für Tests: api.sandbox.ebay.com statt api.ebay.com
-- Rate Limits: 5000 Calls/Tag für Inventory API
 - Kommentare auf Deutsch
 - Kein TypeScript-Fehler (npm run build)
 - Deployment: docker compose up --build -d auf Hostinger VPS
